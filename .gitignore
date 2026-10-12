@@ -31,3 +31,10 @@ Thumbs.db
 
 # Generated integration-validation artifacts
 runs/integration_validation/
+
+# React build output and local package cache
+frontend/node_modules/
+frontend/dist/
+frontend/.pnpm-store/
+frontend/.vite/
+frontend/*.tsbuildinfo

@@ -119,9 +119,28 @@ class CameraFailureTests(unittest.TestCase):
                 return FrameResult(frame, (), (), {}, "test-time")
 
         capture = OneFrameCapture()
+        statuses = []
         with patch("firesight.engine.cv2.VideoCapture", return_value=capture):
-            summary = run_video_source(EngineStub(), "sample.mp4")
+            summary = run_video_source(EngineStub(), "sample.mp4", on_status=lambda state, _error: statuses.append(state))
         self.assertEqual(summary.frames_processed, 1)
+        self.assertTrue(capture.released)
+        self.assertEqual(statuses, ["CONNECTING", "CONNECTED", "OFFLINE"])
+
+    def test_opened_camera_is_not_connected_until_it_returns_a_valid_frame(self):
+        class OpenWithoutFrame:
+            released = False
+            def isOpened(self): return True
+            def get(self, _property): return 20.0
+            def read(self): return True, None
+            def release(self): self.released = True
+        class EngineStub:
+            def reset_session(self): pass
+        capture = OpenWithoutFrame()
+        statuses = []
+        with patch("firesight.engine.cv2.VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(OSError, "usable video frame"):
+                run_video_source(EngineStub(), "sample.mp4", on_status=lambda state, _error: statuses.append(state))
+        self.assertNotIn("CONNECTED", statuses)
         self.assertTrue(capture.released)
 
     def test_rtsp_probe_failure_releases_capture(self):
@@ -149,16 +168,20 @@ class CameraFailureTests(unittest.TestCase):
 
     def test_rtsp_stream_disconnect_uses_bounded_reconnect(self):
         class Capture:
-            def __init__(self): self.released = False
+            def __init__(self): self.released = False; self.reads = 0
             def isOpened(self): return True
             def get(self, _property): return 20.0
-            def read(self): return False, None
+            def read(self):
+                self.reads += 1
+                return (True, np.zeros((8, 8, 3), dtype=np.uint8)) if self.reads == 1 else (False, None)
             def release(self): self.released = True
         captures = [Capture(), Capture()]
         stop = threading.Event()
         statuses = []
         class EngineStub:
             def reset_session(self): pass
+            def process_frame(self, frame, _source, camera_name=None):
+                return FrameResult(frame, (), (), {}, "test-time")
         def status(state, _error):
             statuses.append(state)
             if state == "CONNECTED" and statuses.count("CONNECTED") == 2:
@@ -208,6 +231,13 @@ class EventStoreTests(unittest.TestCase):
             self.assertNotIn("hidden", rows[-1]["source"])
             store.acknowledge(event["event_id"])
             self.assertEqual(store.recent_events()[0]["acknowledged"], 1)
+            self.assertEqual(store.recent_events()[0]["status"], "acknowledged")
+            page, total = store.query_events(limit=10, offset=0, status="acknowledged", event_type="fire")
+            self.assertEqual(total, 1)
+            self.assertEqual(page[0]["event_id"], event["event_id"])
+            self.assertTrue(store.update_status(event["event_id"], "resolved"))
+            self.assertEqual(store.get_event(event["event_id"])["status"], "resolved")
+            self.assertIsNotNone(store.get_event(event["event_id"])["resolved_at"])
             self.assertEqual(store.recent_events()[0]["camera_name"], "Camera 1")
             self.assertEqual(Path(event["evidence_path"]).parent.name, "Camera_1")
         finally:

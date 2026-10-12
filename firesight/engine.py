@@ -258,6 +258,7 @@ def run_video_source(
     capture: cv2.VideoCapture | None = None
     attempts = 0
     final_status = "OFFLINE"
+    connected_frame_received = False
 
     def open_stream() -> cv2.VideoCapture:
         nonlocal attempts
@@ -272,7 +273,6 @@ def run_video_source(
                 if stop_event.wait(min(0.5 * attempts, 2.0)): break
                 continue
             if candidate.isOpened():
-                if on_status: on_status("CONNECTED", None)
                 return candidate
             candidate.release()
             if not is_rtsp or attempts >= reconnect_attempts:
@@ -283,6 +283,8 @@ def run_video_source(
         raise OSError("Camera connection cancelled.")
 
     try:
+        if on_status is not None:
+            on_status("CONNECTING", None)
         capture = open_stream()
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         if not np.isfinite(fps) or fps <= 0 or fps > 240:
@@ -291,6 +293,7 @@ def run_video_source(
             started = time.monotonic()
             ok, frame = capture.read()
             if not ok:
+                connected_frame_received = False
                 capture.release()
                 capture = None
                 is_camera = isinstance(capture_source, int)
@@ -307,6 +310,14 @@ def run_video_source(
                 if stop_event.wait(min(0.5 * attempts, 2.0)): break
                 capture = open_stream()
                 continue
+            if not connected_frame_received:
+                # An opened VideoCapture is not a healthy source until it yields
+                # a real, non-empty frame that the pipeline can process.
+                if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+                    raise OSError("Camera connected but did not provide a usable video frame.")
+                if on_status is not None:
+                    on_status("CONNECTED", None)
+                connected_frame_received = True
             result = engine.process_frame(frame, source_for_log, camera_name=camera_name)
             if save_output and writer is None:
                 engine.config.output_video_dir.mkdir(parents=True, exist_ok=True)
