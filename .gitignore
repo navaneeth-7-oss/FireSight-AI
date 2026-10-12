@@ -1,0 +1,33 @@
+﻿# Python environments and cache
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets and local camera credentials
+.env
+.env.*
+!.env.example
+firesight_config.json
+
+# Runtime data, evidence, databases and logs
+runs/firesight/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Dataset and backup folders
+dataset/
+dataset_backup*/
+backup_before_*/
+
+# IDE and operating system
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Generated integration-validation artifacts
+runs/integration_validation/
