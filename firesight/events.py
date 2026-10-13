@@ -41,6 +41,8 @@ def sanitize_source(source: str | int) -> str:
     parts = urlsplit(value)
     if parts.scheme and parts.netloc:
         host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         if parts.port:
             host = f"{host}:{parts.port}"
         return urlunsplit((parts.scheme, host, parts.path, "", ""))

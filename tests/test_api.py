@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 import shutil
 import tempfile
@@ -14,10 +15,11 @@ import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 
-from firesight.api import create_app, redact_diagnostic
+from firesight.api import FireSightService, create_app, redact_diagnostic
 from firesight.config import DEFAULT_CONFIG_PATH, load_config
 from firesight.engine import FrameResult
 from firesight.events import utc_now
+from firesight.secrets import SecretStoreUnavailable
 
 
 class ApiTests(unittest.TestCase):
@@ -90,7 +92,77 @@ class ApiTests(unittest.TestCase):
         registry = self.service.camera_path.read_text(encoding="utf-8")
         for secret in ("viewer", "private", "secret"):
             self.assertNotIn(secret, registry)
+        protected = self.service.secret_store.path.read_text(encoding="utf-8")
+        for secret in ("viewer", "private", "token=secret"):
+            self.assertNotIn(secret, protected)
         self.assertNotIn("camera.local", self.client.get("/api/cameras").text)
+
+    def test_rtsp_test_before_save_protects_and_recovers_full_url_after_restart(self):
+        payload = {
+            "source": "rtsps://camera.local:8554/live?profile=main&token=required",
+            "username": "view@home",
+            "password": "p:a ss",
+        }
+        exact_url = "rtsps://view%40home:p%3Aa%20ss@camera.local:8554/live?profile=main&token=required"
+        with patch("firesight.api.test_video_connection", return_value=(640, 360)) as probe:
+            tested = self.client.post("/api/cameras/test", json=payload)
+        self.assertEqual(tested.status_code, 200)
+        self.assertTrue(tested.json()["ok"])
+        probe.assert_called_once_with(exact_url)
+        saved = self.client.post("/api/cameras", json={"name": "Front door", "source_type": "rtsp", **payload})
+        self.assertEqual(saved.status_code, 201)
+        for secret in ("view@home", "p:a ss", "required"):
+            self.assertNotIn(secret, saved.text)
+        registry = self.service.camera_path.read_text(encoding="utf-8")
+        protected = self.service.secret_store.path.read_text(encoding="utf-8")
+        for secret in ("view@home", "p:a ss", "required"):
+            self.assertNotIn(secret, registry)
+            self.assertNotIn(secret, protected)
+        with TestClient(create_app(self.config)) as restarted:
+            rows = restarted.get("/api/cameras").json()
+            row = next(camera for camera in rows if camera["name"] == "Front door")
+            self.assertNotIn("source", row)
+            recovered = restarted.app.state.firesight.cameras[row["id"]].source
+            self.assertEqual(recovered, exact_url)
+
+    def test_legacy_camera_record_is_preserved_and_migrated_to_dpapi(self):
+        legacy_url = "rtsp://legacy-user:legacy-pass@camera.local/live?profile=main&token=legacy-token"
+        self.service.camera_path.parent.mkdir(parents=True, exist_ok=True)
+        self.service.camera_path.write_text(json.dumps([{
+            "id": "legacy-camera", "name": "Legacy gate", "source_type": "rtsp", "source": legacy_url,
+        }]), encoding="utf-8")
+        with TestClient(create_app(self.config)) as restarted:
+            service = restarted.app.state.firesight
+            self.assertEqual(service.cameras["legacy-camera"].name, "Legacy gate")
+            self.assertEqual(service.cameras["legacy-camera"].source, legacy_url)
+            registry = service.camera_path.read_text(encoding="utf-8")
+            protected = service.secret_store.path.read_text(encoding="utf-8")
+            for sensitive in ("legacy-user", "legacy-pass", "legacy-token", "token=legacy-token"):
+                self.assertNotIn(sensitive, registry)
+                self.assertNotIn(sensitive, protected)
+
+    def test_rtsp_probe_returns_actionable_redacted_failure(self):
+        with patch("firesight.api.test_video_connection", side_effect=OSError(
+            "401 unauthorized rtsp://viewer:private@camera.local/live?token=secret"
+        )):
+            response = self.client.post("/api/cameras/test", json={
+                "source": "rtsp://camera.local/live?token=secret", "username": "viewer", "password": "private",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("authentication", response.json()["diagnostic"].lower())
+        for secret in ("viewer", "private", "secret"):
+            self.assertNotIn(secret, response.text)
+
+    def test_rtsp_credentials_are_not_saved_when_dpapi_is_unavailable(self):
+        with patch.object(self.service.secret_store, "save", side_effect=SecretStoreUnavailable("unavailable")):
+            response = self.client.post("/api/cameras", json={
+                "name": "Protected camera", "source_type": "rtsp", "source": "rtsp://camera.local/live",
+                "username": "viewer", "password": "private",
+            })
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("DPAPI", response.json()["detail"])
+        self.assertNotIn("viewer", response.text)
+        self.assertFalse(self.service.camera_path.exists())
 
     def test_incident_filters_pagination_lifecycle_and_evidence_path_confinement(self):
         first = self.make_event()
@@ -124,7 +196,9 @@ class ApiTests(unittest.TestCase):
         self.assertTrue((Path(self.temp.name) / "runs" / "firesight" / "api_settings.json").is_file())
 
     def test_camera_worker_is_singleton_and_second_active_source_is_rejected(self):
-        camera = self.service.cameras["default"]
+        clip = Path(self.temp.name) / "sample.mp4"
+        clip.write_bytes(b"mock video path")
+        camera = self.client.post("/api/cameras", json={"name": "Validation video", "source_type": "video", "source": str(clip)}).json()
         other = self.client.post("/api/cameras", json={"name": "Second", "source_type": "webcam", "source": "1"}).json()
         started = threading.Event()
         calls = []
@@ -139,17 +213,22 @@ class ApiTests(unittest.TestCase):
             on_status("OFFLINE", None)
 
         with patch("firesight.api.run_video_source", side_effect=fake_worker):
-            first = self.client.post(f"/api/cameras/{camera.camera_id}/connect")
+            first = self.client.post(f"/api/cameras/{camera['id']}/connect")
             self.assertEqual(first.status_code, 200)
             self.assertTrue(started.wait(2))
-            again = self.client.post(f"/api/cameras/{camera.camera_id}/connect")
+            again = self.client.post(f"/api/cameras/{camera['id']}/connect")
             self.assertEqual(again.status_code, 200)
             conflict = self.client.post(f"/api/cameras/{other['id']}/connect")
             self.assertEqual(conflict.status_code, 409)
             settings_conflict = self.client.patch("/api/settings", json={"reconnect_attempts": 3})
             self.assertEqual(settings_conflict.status_code, 409)
             self.assertEqual(len(calls), 1)
-            stopped = self.client.post(f"/api/cameras/{camera.camera_id}/disconnect")
+            paused = self.client.post(f"/api/cameras/{camera['id']}/pause")
+            self.assertEqual(paused.json()["status"], "paused")
+            resumed = self.client.post(f"/api/cameras/{camera['id']}/resume")
+            self.assertEqual(resumed.json()["status"], "connecting")
+            self.assertEqual(self.client.post(f"/api/cameras/{other['id']}/pause").status_code, 409)
+            stopped = self.client.post(f"/api/cameras/{camera['id']}/disconnect")
             self.assertEqual(stopped.status_code, 200)
             self.assertEqual(stopped.json()["status"], "disconnected")
 
@@ -182,6 +261,17 @@ class DiagnosticRedactionTests(unittest.TestCase):
         for secret in ("viewer", "private", "secret"):
             self.assertNotIn(secret, redacted)
         self.assertIn("camera.local", redacted)
+
+    def test_connection_diagnostics_distinguish_common_failure_types(self):
+        cases = [
+            (TimeoutError("connect timeout"), "timed out"),
+            (OSError("Camera host is unreachable"), "unreachable"),
+            (OSError("401 unauthorized"), "authentication"),
+            (OSError("The RTSP service did not open the stream"), "path/channel"),
+        ]
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                self.assertIn(expected, FireSightService.connection_diagnostic(error).lower())
 
 
 if __name__ == "__main__":

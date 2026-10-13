@@ -12,6 +12,9 @@ export type Camera = {
   inference_ms: number | null;
   fps: number | null;
   frame_number: number;
+  video_total_frames?: number | null;
+  video_progress?: number | null;
+  video_duration_seconds?: number | null;
 };
 
 export type Incident = {

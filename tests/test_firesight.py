@@ -5,10 +5,11 @@ import logging
 import shutil
 import threading
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
@@ -143,16 +144,63 @@ class CameraFailureTests(unittest.TestCase):
         self.assertNotIn("CONNECTED", statuses)
         self.assertTrue(capture.released)
 
+    def test_local_video_pause_holds_capture_and_resume_continues_pipeline(self):
+        class ContinuousCapture:
+            released = False
+            reads = 0
+            def isOpened(self): return True
+            def get(self, _property): return 30.0
+            def read(self):
+                self.reads += 1
+                return True, np.zeros((8, 8, 3), dtype=np.uint8)
+            def release(self): self.released = True
+        class EngineStub:
+            def reset_session(self): pass
+            def process_frame(self, frame, _source, camera_name=None): return FrameResult(frame, (), (), {}, "test-time")
+
+        capture, stop, pause = ContinuousCapture(), threading.Event(), threading.Event()
+        statuses, frames, result = [], [], []
+        def on_frame(_frame):
+            frames.append(1)
+            if len(frames) == 1:
+                pause.set()
+            elif len(frames) == 2:
+                stop.set()
+        def worker():
+            with patch("firesight.engine.cv2.VideoCapture", return_value=capture):
+                result.append(run_video_source(EngineStub(), "sample.mp4", stop_event=stop, pause_event=pause,
+                                               on_frame=on_frame, on_status=lambda state, _error: statuses.append(state)))
+        thread = threading.Thread(target=worker)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while "PAUSED" not in statuses and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("PAUSED", statuses)
+        reads_while_paused = capture.reads
+        time.sleep(0.08)
+        self.assertEqual(capture.reads, reads_while_paused)
+        pause.clear()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result[0].frames_processed, 2)
+        self.assertIn("CONNECTED", statuses[statuses.index("PAUSED") + 1:])
+        self.assertTrue(capture.released)
+
     def test_rtsp_probe_failure_releases_capture(self):
         class Unavailable:
             released = False
             def isOpened(self): return False
             def release(self): self.released = True
         capture = Unavailable()
-        with patch("firesight.engine.cv2.VideoCapture", return_value=capture):
-            with self.assertRaisesRegex(OSError, "Unable to connect"):
+        with patch("firesight.engine.socket.create_connection", return_value=MagicMock()), patch("firesight.engine.cv2.VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(OSError, "did not open the stream"):
                 test_video_connection("rtsp://camera.local/live")
         self.assertTrue(capture.released)
+
+    def test_rtsp_probe_identifies_refused_network_port(self):
+        with patch("firesight.engine.socket.create_connection", side_effect=ConnectionRefusedError()):
+            with self.assertRaisesRegex(OSError, "refused the RTSP port"):
+                test_video_connection("rtsp://camera.local/live")
 
     def test_rtsp_probe_timeout_releases_capture(self):
         class TimedOut:
@@ -161,7 +209,7 @@ class CameraFailureTests(unittest.TestCase):
             def read(self): raise cv2.error("read timeout")
             def release(self): self.released = True
         capture = TimedOut()
-        with patch("firesight.engine._open_capture", return_value=capture):
+        with patch("firesight.engine.socket.create_connection", return_value=MagicMock()), patch("firesight.engine._open_capture", return_value=capture):
             with self.assertRaisesRegex(cv2.error, "timeout"):
                 test_video_connection("rtsp://camera.local/live")
         self.assertTrue(capture.released)
@@ -273,6 +321,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("viewer", sanitize_source(url))
         with self.assertRaises(ValueError): build_rtsp_url("")
         with self.assertRaises(ValueError): build_rtsp_url("http://camera.local/stream")
+
+    def test_rtsp_url_preserves_encoded_credentials_ipv6_and_query(self):
+        url = build_rtsp_url("rtsps://[2001:db8::1]:8554/live?profile=main&token=required", "viewer@site", "p:a ss")
+        self.assertEqual(url, "rtsps://viewer%40site:p%3Aa%20ss@[2001:db8::1]:8554/live?profile=main&token=required")
+        self.assertEqual(build_rtsp_url("rtsp://u%40ser:p%3Ass@camera/live?x=1"), "rtsp://u%40ser:p%3Ass@camera/live?x=1")
 
     def test_config_saving_never_persists_credentials(self):
         project_root = Path(__file__).resolve().parents[1]

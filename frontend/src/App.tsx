@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { API, api, apiJson, apiUpload, type Analytics, type Camera, type ImageAnalysis, type Incident, type Page, type Settings, type SystemStatus, formatTime } from "./api";
 
 type Section = "overview" | "monitor" | "sources" | "incidents" | "evidence" | "analytics" | "alerts" | "health" | "settings";
@@ -41,7 +41,7 @@ function App() {
   const [page, setPage] = useState(1);
   const [selectedEvent, setSelectedEvent] = useState<Incident | null>(null);
   const [evidenceBroken, setEvidenceBroken] = useState(false);
-  const [sourceForm, setSourceForm] = useState({ name: "", source_type: "webcam", source: "0" });
+  const [sourceForm, setSourceForm] = useState({ name: "", source_type: "webcam", source: "0", username: "", password: "" });
 
   const loadOperational = useCallback(async () => {
     try {
@@ -90,7 +90,7 @@ function App() {
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 3500); return () => window.clearTimeout(timer); }, [toast]);
 
   const selectedCamera = cameras.find((camera) => camera.id === selectedId) || null;
-  const activeCamera = cameras.find((camera) => camera.active && camera.status === "connected") || null;
+  const activeCamera = cameras.find((camera) => camera.active && ["connected", "paused"].includes(camera.status)) || null;
   const latestEvents = events?.items.slice(0, 5) || [];
   const doAction = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key); setError("");
@@ -99,6 +99,33 @@ function App() {
     finally { setBusy(""); }
   };
   const switchCamera = (id: string) => { setSelectedId(id); setEvidenceBroken(false); };
+  const startOverviewSource = async (sourceType: Camera["source_type"], source: string, name: string, username = "", password = "") => {
+    setBusy("overview-source"); setError("");
+    try {
+      const credentials = sourceType === "rtsp" ? { username, password } : {};
+      if (sourceType === "rtsp") {
+        const tested = await api<{ ok: boolean; diagnostic?: string }>("/api/cameras/test", apiJson("POST", { source, ...credentials }));
+        if (!tested.ok) throw new Error(tested.diagnostic || "Camera did not provide a video frame.");
+      }
+      const camera = await api<Camera>("/api/cameras", apiJson("POST", { name, source_type: sourceType, source, ...credentials }));
+      setSelectedId(camera.id);
+      await api<Camera>(`/api/cameras/${camera.id}/connect`, apiJson("POST"));
+      await loadOperational();
+      setToast(`${name} started`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not start source"); }
+    finally { setBusy(""); }
+  };
+  const uploadOverviewVideo = async (file: File, name: string) => {
+    setBusy("overview-source"); setError("");
+    try {
+      const camera = await apiUpload<Camera>(`/api/cameras/upload?name=${encodeURIComponent(name)}`, file);
+      setSelectedId(camera.id);
+      await api<Camera>(`/api/cameras/${camera.id}/connect`, apiJson("POST"));
+      await loadOperational();
+      setToast(`${file.name} processing started`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not process video"); }
+    finally { setBusy(""); }
+  };
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -114,7 +141,7 @@ function App() {
       <header className="topbar"><div><h1>{titles[section]}</h1><p>{selectedCamera ? `${selectedCamera.name} · ${selectedCamera.source_label}` : "No camera configured"}</p></div><div className="topbar-right"><span className={`status-pill ${system?.model === "ready" ? "ok" : system?.model === "error" ? "danger" : "warning"}`}><i />{system?.model === "ready" ? "INFERENCE READY" : system?.model === "error" ? "MODEL ERROR" : "INITIALIZING"}</span><time>{new Date().toLocaleTimeString()}</time></div></header>
       {error && <div className="notice error" role="alert"><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
       <div className="page-content">
-        {section === "overview" && <Overview cameras={cameras} system={system} active={activeCamera} incidents={latestEvents} analytics={analytics} onNavigate={setSection} onSelect={switchCamera} />}
+        {section === "overview" && <Overview cameras={cameras} system={system} active={activeCamera} selected={selectedCamera} incidents={latestEvents} analytics={analytics} onNavigate={setSection} onSelect={switchCamera} onStartSource={startOverviewSource} onUploadVideo={uploadOverviewVideo} doAction={doAction} busy={busy} />}
         {section === "monitor" && <Monitor cameras={cameras} selected={selectedCamera} selectedId={selectedId} onSelect={switchCamera} doAction={doAction} busy={busy} runImage={(file) => apiUpload<ImageAnalysis>("/api/detect/image", file)} />}
         {section === "sources" && <Sources cameras={cameras} selectedId={selectedId} onSelect={switchCamera} form={sourceForm} setForm={setSourceForm} doAction={doAction} busy={busy} />}
         {(section === "incidents" || section === "alerts") && <IncidentTable events={events} section={section} query={query} setQuery={(value) => { setQuery(value); setPage(1); }} eventType={eventType} setEventType={(value) => { setEventType(value); setPage(1); }} eventStatus={eventStatus} setEventStatus={(value) => { setEventStatus(value); setPage(1); }} eventSeverity={eventSeverity} setEventSeverity={(value) => { setEventSeverity(value); setPage(1); }} eventCamera={eventCamera} setEventCamera={(value) => { setEventCamera(value); setPage(1); }} eventStart={eventStart} setEventStart={(value) => { setEventStart(value); setPage(1); }} eventEnd={eventEnd} setEventEnd={(value) => { setEventEnd(value); setPage(1); }} sortOrder={sortOrder} setSortOrder={(value) => { setSortOrder(value); setPage(1); }} page={page} setPage={setPage} onStatus={(id, status) => doAction(`event-${id}`, () => api(`/api/incidents/${id}`, apiJson("PATCH", { status })))} onEvidence={(event) => { setSelectedEvent(event); setEvidenceBroken(false); setSection("evidence"); }} busy={busy} />}
@@ -130,28 +157,69 @@ function App() {
 }
 
 function SummaryCards({ cameras, system, incidents, analytics }: { cameras: Camera[]; system: SystemStatus | null; incidents: Incident[]; analytics: Analytics | null }) {
-  const connected = cameras.filter((camera) => camera.status === "connected").length;
-  const active = cameras.find((camera) => camera.status === "connected");
+  const connected = cameras.filter((camera) => camera.status === "connected" || camera.status === "paused").length;
+  const active = cameras.find((camera) => camera.status === "connected" || camera.status === "paused");
   const total = analytics?.total_events ?? incidents.length;
   return <div className="summary-grid">
-    <article className="summary-card"><div className="summary-label">CAMERA STATUS</div><div className="summary-main"><strong>{connected} <small>/ {cameras.length}</small></strong><span className={`state-text ${connected ? "teal" : "muted"}`}>{connected ? "STREAMING" : cameras.length ? "DISCONNECTED" : "NO SOURCES"}</span></div><p>{cameras.length ? `${cameras.filter((camera) => camera.active).length} active · ${cameras.length - cameras.filter((camera) => camera.active).length} idle` : "Add a camera source to begin"}</p></article>
+    <article className="summary-card"><div className="summary-label">CAMERA STATUS</div><div className="summary-main"><strong>{connected} <small>/ {cameras.length}</small></strong><span className={`state-text ${connected ? "teal" : "muted"}`}>{active?.status === "paused" ? "PAUSED" : connected ? "STREAMING" : cameras.length ? "DISCONNECTED" : "NO SOURCES"}</span></div><p>{cameras.length ? `${cameras.filter((camera) => camera.active).length} active · ${cameras.length - cameras.filter((camera) => camera.active).length} idle` : "Add a camera source to begin"}</p></article>
     <article className="summary-card"><div className="summary-label">LIVE PERFORMANCE</div><div className="summary-main"><strong>{active?.fps != null ? active.fps : system?.model === "ready" ? "—" : system?.model === "error" ? "Unavailable" : "Loading"}</strong><span className={`state-text ${active ? "teal" : "muted"}`}>{active ? "FPS" : "NO LIVE SOURCE"}</span></div><p>{active?.inference_ms != null ? `${active.inference_ms} ms inference` : `${system?.active_sources || 0} active · ${system?.max_active_sources || 1} source capacity`}</p></article>
     <article className="summary-card"><div className="summary-label">DETECTION SUMMARY</div><div className="summary-main"><strong>{total}</strong><span className="state-text muted">STORED EVENTS</span></div><p>{analytics?.by_class.fire || 0} fire · {analytics?.by_class.smoke || 0} smoke across persisted history</p></article>
   </div>;
 }
 
-function Overview({ cameras, system, active, incidents, analytics, onNavigate, onSelect }: { cameras: Camera[]; system: SystemStatus | null; active: Camera | null; incidents: Incident[]; analytics: Analytics | null; onNavigate: (value: Section) => void; onSelect: (id: string) => void }) {
+function Overview({ cameras, system, active, selected, incidents, analytics, onNavigate, onSelect, onStartSource, onUploadVideo, doAction, busy }: { cameras: Camera[]; system: SystemStatus | null; active: Camera | null; selected: Camera | null; incidents: Incident[]; analytics: Analytics | null; onNavigate: (value: Section) => void; onSelect: (id: string) => void; onStartSource: (type: Camera["source_type"], source: string, name: string, username?: string, password?: string) => Promise<void>; onUploadVideo: (file: File, name: string) => Promise<void>; doAction: (key: string, fn: () => Promise<unknown>) => Promise<void>; busy: string }) {
+  const [mode, setMode] = useState<Camera["source_type"]>("video");
+  const [device, setDevice] = useState("0");
+  const [cameraName, setCameraName] = useState("Laptop Webcam");
+  const [rtsp, setRtsp] = useState("");
+  const [rtspUsername, setRtspUsername] = useState("");
+  const [rtspPassword, setRtspPassword] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [videoName, setVideoName] = useState("");
+  const connecting = busy === "overview-source";
+  const workerSource = active || (selected?.active ? selected : null);
+  const preview = active || (selected?.source_type === "video" && selected.frame_number > 0 ? selected : null);
+  const previewUrl = preview ? `${API}/api/cameras/${preview.id}/${preview.active ? "stream" : "snapshot"}` : "";
+  const videoComplete = Boolean(preview?.source_type === "video" && !preview.active && preview.video_total_frames && preview.frame_number >= preview.video_total_frames);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (connecting || busy) return;
+    if (mode === "video") { if (file) void onUploadVideo(file, videoName.trim() || file.name.replace(/\.[^.]+$/, "")); return; }
+    if (mode === "webcam") { void onStartSource("webcam", device, cameraName.trim() || `Webcam ${device}`); return; }
+    if (rtsp.trim()) void onStartSource("rtsp", rtsp.trim(), cameraName === "Laptop Webcam" ? "CCTV Camera" : cameraName.trim() || "CCTV Camera", rtspUsername, rtspPassword);
+  };
   return <>
     <SummaryCards cameras={cameras} system={system} incidents={incidents} analytics={analytics} />
     <div className="overview-grid">
-      <section className="panel preview-panel"><div className="panel-heading"><div><h2>Monitoring preview</h2><p>{active ? `${active.name} · frame ${active.frame_number}` : "No active video source"}</p></div><button className="button subtle" onClick={() => onNavigate("monitor")}>Open monitor&nbsp; ↗</button></div>
-        {active ? <img className="preview-image" src={`${API}/api/cameras/${active.id}/stream`} alt={`Live annotated feed from ${active.name}`} /> : <div className="empty-feed"><span className="camera-glyph">◎</span><strong>No live feed</strong><p>Select a camera and connect after the model is ready.</p><button className="button primary" onClick={() => onNavigate("sources")}>Manage camera sources</button></div>}
+      <section className="panel preview-panel">
+        <div className="panel-heading"><div><h2>Monitoring preview</h2><p>{preview ? `${preview.name} · ${preview.source_type.toUpperCase()} · ${videoComplete ? "complete" : preview.status}` : "No active video source"}</p></div><button className="button subtle" onClick={() => onNavigate("monitor")}>Open monitor&nbsp; ↗</button></div>
+        <div className="overview-source-picker">
+          <div className="source-mode-tabs" role="tablist" aria-label="Choose video source">
+            {([["video", "Video file"], ["webcam", "Laptop webcam"], ["rtsp", "CCTV / IP camera"]] as const).map(([value, label]) => <button type="button" role="tab" aria-selected={mode === value} className={mode === value ? "selected" : ""} key={value} onClick={() => setMode(value)}>{label}</button>)}
+          </div>
+          <form className="overview-source-form" onSubmit={submit}>
+            {mode === "video" && <><label className="field"><span>LOCAL VIDEO · MP4, AVI, MOV, MKV</span><input type="file" accept="video/mp4,video/x-msvideo,video/quicktime,video/x-matroska,.avi,.mov,.mkv,.webm,.wmv" onChange={(event) => { const chosen = event.target.files?.[0] || null; setFile(chosen); setVideoName(chosen?.name.replace(/\.[^.]+$/, "") || ""); }} disabled={!!busy} /></label>{file && <small className="form-hint">{file.name} · uploaded to the local API for validation and processing</small>}</>}
+            {mode === "webcam" && <><label className="field"><span>DEVICE INDEX</span><input type="number" min="0" max="32" value={device} onChange={(event) => setDevice(event.target.value)} disabled={!!busy} /></label><label className="field"><span>SOURCE LABEL</span><input value={cameraName} onChange={(event) => setCameraName(event.target.value)} maxLength={80} disabled={!!busy} /></label></>}
+            {mode === "rtsp" && <><label className="field"><span>RTSP / RTSPS ENDPOINT</span><input type="password" autoComplete="new-password" spellCheck={false} value={rtsp} onChange={(event) => setRtsp(event.target.value)} placeholder="rtsp://camera-host:554/stream" maxLength={2048} disabled={!!busy} /></label><label className="field"><span>USERNAME · OPTIONAL</span><input autoComplete="off" value={rtspUsername} onChange={(event) => setRtspUsername(event.target.value)} maxLength={256} disabled={!!busy} /></label><label className="field"><span>PASSWORD · OPTIONAL</span><input type="password" autoComplete="new-password" value={rtspPassword} onChange={(event) => setRtspPassword(event.target.value)} maxLength={256} disabled={!!busy} /></label><label className="field"><span>SOURCE LABEL</span><input value={cameraName === "Laptop Webcam" ? "CCTV Camera" : cameraName} onChange={(event) => setCameraName(event.target.value)} maxLength={80} disabled={!!busy} /></label><small className="form-hint">FireSight tests for a readable frame before saving. Credentials and URL parameters are protected with Windows DPAPI and never returned by the API.</small></>}
+            <button className="button primary" type="submit" disabled={!!busy || (mode === "video" ? !file : mode === "rtsp" ? !rtsp.trim() : !device.trim())}>{connecting ? "Preparing source…" : mode === "video" ? "Upload & start" : "Connect source"}</button>
+          </form>
+        </div>
+        {cameras.length > 0 && <label className="field overview-active-select"><span>CONFIGURED SOURCE</span><select value={selected?.id || ""} onChange={(event) => onSelect(event.target.value)}>{cameras.map((camera) => <option key={camera.id} value={camera.id}>{camera.name} · {camera.status}</option>)}</select></label>}
+        {workerSource && <div className="overview-live-controls"><span className={`inline-state ${videoComplete ? "connected" : workerSource.status}`}>{videoComplete ? "COMPLETE" : workerSource.status.toUpperCase()}</span><span>{workerSource.source_label} · frame {workerSource.frame_number}{workerSource.last_frame_at ? ` · ${formatTime(workerSource.last_frame_at)}` : ""}</span><div>
+          {workerSource.source_type === "video" && workerSource.status === "connected" && <button className="button subtle" disabled={!!busy} onClick={() => void doAction("pause", () => api(`/api/cameras/${workerSource.id}/pause`, apiJson("POST")))}>Pause</button>}
+          {workerSource.source_type === "video" && workerSource.status === "paused" && <button className="button subtle" disabled={!!busy} onClick={() => void doAction("resume", () => api(`/api/cameras/${workerSource.id}/resume`, apiJson("POST")))}>Resume</button>}
+          <button className="button danger" disabled={!!busy} onClick={() => void doAction("disconnect", () => api(`/api/cameras/${workerSource.id}/disconnect`, apiJson("POST")))}>Stop</button>
+        </div></div>}
+        {preview ? <><img className="preview-image" src={previewUrl} alt={`${preview.status === "paused" ? "Paused" : preview.active ? "Live annotated" : "Last processed"} feed from ${preview.name}`} />{preview.source_type === "video" && preview.video_progress != null && <div className="video-progress"><div><span>{videoComplete ? "VIDEO COMPLETE" : preview.status === "paused" ? "VIDEO PAUSED" : "VIDEO PROCESSING"}</span><strong>{Math.round(preview.video_progress * 100)}%</strong></div><progress max="1" value={preview.video_progress} /><small>{preview.frame_number.toLocaleString()} / {(preview.video_total_frames || 0).toLocaleString()} frames{preview.video_duration_seconds ? ` · ${Math.round(preview.video_duration_seconds)} sec source` : ""}</small></div>}</> : <div className="empty-feed"><span className="camera-glyph">◎</span><strong>{selected?.status === "connecting" ? "Connecting to source…" : selected?.status === "error" ? "Source unavailable" : "No live feed"}</strong><p>{selected?.last_error || (selected ? `${selected.name} is idle. Start it here or from Camera Sources.` : "Choose a video file, webcam, or CCTV endpoint to begin.")}</p></div>}
+        {selected && !selected.active && <button className="button subtle overview-reconnect" disabled={!!busy || selected.status === "connecting"} onClick={() => void doAction("connect", () => api(`/api/cameras/${selected.id}/connect`, apiJson("POST")))}>Connect selected source</button>}
+        {selected?.last_error && <div className="notice error" role="status">{selected.last_error}</div>}
       </section>
       <section className="panel activity-panel"><div className="panel-heading"><div><h2>Recent incidents</h2><p>Latest persisted events</p></div><button className="text-action" onClick={() => onNavigate("incidents")}>View all</button></div>
-        {incidents.length ? <div className="activity-list">{incidents.map((event) => <div className="activity-row" key={event.event_id}><span className={`event-marker ${event.event_class}`} /><div className="activity-copy"><strong>{event.event_class}</strong><small>{event.camera_name} · {formatTime(event.timestamp)}</small></div><span className={`severity ${event.severity.toLowerCase()}`}>{event.severity}</span></div>)}</div> : <div className="empty-list">No stored incidents yet.</div>}
+        {incidents.length ? <div className="activity-list">{incidents.map((event) => <div className="activity-row" key={event.event_id}><span className={`event-marker ${event.event_class}`} /><div className="activity-copy"><strong>{event.event_class} · {(event.confidence * 100).toFixed(1)}%</strong><small>{event.camera_name} · {formatTime(event.timestamp)}</small></div><span className={`severity ${event.severity.toLowerCase()}`}>{event.severity}</span></div>)}</div> : <div className="empty-list">No stored incidents yet.</div>}
+        <div className="overview-performance"><strong>Live inference</strong><div><span>FPS</span><b>{active?.fps ?? "—"}</b></div><div><span>Latency</span><b>{active?.inference_ms != null ? `${active.inference_ms} ms` : "—"}</b></div><div><span>Last frame</span><b>{formatTime(active?.last_frame_at)}</b></div><small>Operational metrics · not offline model evaluation</small></div>
       </section>
     </div>
-    <section className="panel camera-strip"><div className="panel-heading"><div><h2>Camera availability</h2><p>Connection state is based on the latest capture worker frame.</p></div><button className="text-action" onClick={() => onNavigate("sources")}>Manage sources</button></div>
+    <section className="panel camera-strip"><div className="panel-heading"><div><h2>Camera availability</h2><p>One source can run inference at a time; state requires a valid captured frame.</p></div><button className="text-action" onClick={() => onNavigate("sources")}>Manage sources</button></div>
       {cameras.length ? <div className="camera-cards">{cameras.slice(0, 4).map((camera) => <button key={camera.id} className="camera-tile" onClick={() => { onSelect(camera.id); onNavigate("monitor"); }}><span className={`online-dot ${camera.status}`} /><span><strong>{camera.name}</strong><small>{camera.source_type.toUpperCase()} · {camera.status}</small></span><span className="tile-chevron">›</span></button>)}</div> : <div className="empty-list">No camera sources configured.</div>}
     </section>
   </>;
@@ -176,21 +244,23 @@ function Monitor({ cameras, selected, selectedId, onSelect, doAction, busy, runI
   </>;
 }
 
-function Sources({ cameras, selectedId, onSelect, form, setForm, doAction, busy }: { cameras: Camera[]; selectedId: string; onSelect: (id: string) => void; form: { name: string; source_type: string; source: string }; setForm: (value: { name: string; source_type: string; source: string }) => void; doAction: (key: string, fn: () => Promise<unknown>) => Promise<void>; busy: string }) {
+function Sources({ cameras, selectedId, onSelect, form, setForm, doAction, busy }: { cameras: Camera[]; selectedId: string; onSelect: (id: string) => void; form: { name: string; source_type: string; source: string; username: string; password: string }; setForm: (value: { name: string; source_type: string; source: string; username: string; password: string }) => void; doAction: (key: string, fn: () => Promise<unknown>) => Promise<void>; busy: string }) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [editName, setEditName] = useState("");
   const [editSource, setEditSource] = useState("");
+  const [editUsername, setEditUsername] = useState("");
+  const [editPassword, setEditPassword] = useState("");
   const selected = cameras.find((camera) => camera.id === selectedId) || null;
-  useEffect(() => { setEditName(selected?.name || ""); setEditSource(""); }, [selectedId, selected?.name]);
+  useEffect(() => { setEditName(selected?.name || ""); setEditSource(""); setEditUsername(""); setEditPassword(""); }, [selectedId, selected?.name]);
   const update = (key: string, value: string) => setForm({ ...form, [key]: value });
   return <div className="sources-layout"><section className="panel source-list"><div className="panel-heading"><div><h2>Configured sources</h2><p>Saved source records · credentials are not returned</p></div><span className="count-badge">{cameras.length}</span></div>
     {cameras.length ? cameras.map((camera) => <article className={`source-row ${selectedId === camera.id ? "selected" : ""}`} key={camera.id}><button className="source-select" onClick={() => onSelect(camera.id)}><span className={`online-dot ${camera.status}`} /><span><strong>{camera.name}</strong><small>{camera.source_type.toUpperCase()} · {camera.source_label}</small><small>State: {camera.status} · Last frame: {formatTime(camera.last_frame_at)}</small></span></button><div className="source-actions"><button className="button subtle" disabled={!!busy} onClick={() => void doAction(`test-${camera.id}`, async () => { const result = await api<{ ok: boolean; status: string; diagnostic?: string; width?: number; height?: number }>(`/api/cameras/${camera.id}/test`, apiJson("POST")); if (!result.ok) throw new Error(result.diagnostic || "No valid frame received"); })}>Test</button>{camera.active ? <button className="button danger" disabled={!!busy} onClick={() => void doAction(`stop-${camera.id}`, () => api(`/api/cameras/${camera.id}/disconnect`, apiJson("POST")))}>Stop</button> : <button className="button primary" disabled={!!busy} onClick={() => void doAction(`start-${camera.id}`, () => api(`/api/cameras/${camera.id}/connect`, apiJson("POST")))}>Connect</button>}<button className="icon-button" aria-label={`Remove ${camera.name}`} disabled={!!busy || camera.active} onClick={() => void doAction(`delete-${camera.id}`, () => api(`/api/cameras/${camera.id}`, { method: "DELETE" }))}>×</button></div></article>) : <div className="empty-list">No sources configured.</div>}
-    {selected && <form className="edit-source-form" onSubmit={(event) => { event.preventDefault(); void doAction(`edit-${selected.id}`, () => api(`/api/cameras/${selected.id}`, apiJson("PATCH", { name: editName, ...(editSource.trim() ? { source: editSource.trim() } : {}) }))); }}><div className="panel-heading"><div><h2>Edit selected source</h2><p>Credentials and saved endpoints are not returned to the browser.</p></div></div><label className="field"><span>DISPLAY NAME</span><input value={editName} onChange={(event) => setEditName(event.target.value)} required maxLength={80} /></label><label className="field"><span>REPLACE SOURCE (OPTIONAL)</span><input value={editSource} onChange={(event) => setEditSource(event.target.value)} type={selected.source_type === "rtsp" ? "password" : "text"} autoComplete="off" placeholder={selected.source_type === "rtsp" ? "rtsp://camera/stream" : selected.source_type === "video" ? "Server-local path to a video" : "Webcam device index"} /></label><small>Leave blank to retain the current source. Video uploads can be replaced by adding a new upload and removing this entry.</small><button className="button subtle" disabled={!!busy}>Save source changes</button></form>}
-  </section><section className="panel add-source"><div className="panel-heading"><div><h2>Add a source</h2><p>Source configuration is saved locally.</p></div></div><form onSubmit={(event) => { event.preventDefault(); void doAction("add-source", async () => { if (form.source_type === "video") { if (!videoFile) throw new Error("Choose a local video file first"); const params = new URLSearchParams({ name: form.name }); await apiUpload(`/api/cameras/upload?${params}`, videoFile); setVideoFile(null); } else { await api("/api/cameras", apiJson("POST", { name: form.name, source_type: form.source_type, source: form.source })); } setForm({ name: "", source_type: "webcam", source: "0" }); }); }}>
+    {selected && <form className="edit-source-form" onSubmit={(event) => { event.preventDefault(); void doAction(`edit-${selected.id}`, async () => { const hasRtspChanges = Boolean(editSource.trim() || editUsername || editPassword); const rtspCredentials = { username: editUsername, password: editPassword }; if (selected.source_type === "rtsp" && hasRtspChanges) { const tested = await api<{ ok: boolean; diagnostic?: string }>(`/api/cameras/${selected.id}/test`, apiJson("POST", { ...(editSource.trim() ? { source: editSource.trim() } : {}), ...rtspCredentials })); if (!tested.ok) throw new Error(tested.diagnostic || "Camera did not provide a video frame."); } await api(`/api/cameras/${selected.id}`, apiJson("PATCH", { name: editName, ...(editSource.trim() ? { source: editSource.trim() } : {}), ...(selected.source_type === "rtsp" && hasRtspChanges ? rtspCredentials : {}) })); }); }}><div className="panel-heading"><div><h2>Edit selected source</h2><p>Credentials and saved endpoints are not returned to the browser.</p></div></div><label className="field"><span>DISPLAY NAME</span><input value={editName} onChange={(event) => setEditName(event.target.value)} required maxLength={80} /></label><label className="field"><span>REPLACE SOURCE (OPTIONAL)</span><input value={editSource} onChange={(event) => setEditSource(event.target.value)} type={selected.source_type === "rtsp" ? "password" : "text"} autoComplete="off" placeholder={selected.source_type === "rtsp" ? "rtsp://camera/stream" : selected.source_type === "video" ? "Server-local path to a video" : "Webcam device index"} /></label>{selected.source_type === "rtsp" && <><label className="field"><span>NEW USERNAME · OPTIONAL</span><input autoComplete="off" value={editUsername} onChange={(event) => setEditUsername(event.target.value)} maxLength={256} /></label><label className="field"><span>NEW PASSWORD · OPTIONAL</span><input type="password" autoComplete="new-password" value={editPassword} onChange={(event) => setEditPassword(event.target.value)} maxLength={256} /></label><small>Entered changes are tested before save. Leave the endpoint blank to retain it; blank credential fields retain embedded URL credentials.</small></>}<small>Leave blank to retain the current source. Video uploads can be replaced by adding a new upload and removing this entry.</small><button className="button subtle" disabled={!!busy}>Save source changes</button></form>}
+  </section><section className="panel add-source"><div className="panel-heading"><div><h2>Add a source</h2><p>Source configuration is saved locally.</p></div></div><form onSubmit={(event) => { event.preventDefault(); void doAction("add-source", async () => { if (form.source_type === "video") { if (!videoFile) throw new Error("Choose a local video file first"); const params = new URLSearchParams({ name: form.name }); await apiUpload(`/api/cameras/upload?${params}`, videoFile); setVideoFile(null); } else { if (form.source_type === "rtsp") { const tested = await api<{ ok: boolean; diagnostic?: string }>("/api/cameras/test", apiJson("POST", { source: form.source, username: form.username, password: form.password })); if (!tested.ok) throw new Error(tested.diagnostic || "Camera did not provide a video frame."); } await api("/api/cameras", apiJson("POST", { name: form.name, source_type: form.source_type, source: form.source, ...(form.source_type === "rtsp" ? { username: form.username, password: form.password } : {}) })); } setForm({ name: "", source_type: "webcam", source: "0", username: "", password: "" }); }); }}>
     <label className="field"><span>DISPLAY NAME</span><input required maxLength={80} value={form.name} onChange={(event) => update("name", event.target.value)} placeholder="North entrance" /></label>
-    <label className="field"><span>SOURCE TYPE</span><select value={form.source_type} onChange={(event) => setForm({ ...form, source_type: event.target.value, source: event.target.value === "webcam" ? "0" : "" })}><option value="webcam">Webcam / device index</option><option value="rtsp">RTSP / RTSPS stream</option><option value="video">Local video path</option></select></label>
+    <label className="field"><span>SOURCE TYPE</span><select value={form.source_type} onChange={(event) => setForm({ ...form, source_type: event.target.value, source: event.target.value === "webcam" ? "0" : "", username: "", password: "" })}><option value="webcam">Webcam / device index</option><option value="rtsp">RTSP / RTSPS stream</option><option value="video">Local video path</option></select></label>
     {form.source_type === "video" ? <label className="field"><span>LOCAL VIDEO FILE · MAX 200 MIB</span><input required type="file" accept="video/mp4,video/avi,video/quicktime,video/x-matroska,video/webm,video/x-msvideo" onChange={(event) => setVideoFile(event.target.files?.[0] || null)} /><small>The API verifies a readable frame before saving the uploaded clip.</small></label> : <label className="field"><span>{form.source_type === "webcam" ? "DEVICE INDEX" : "RTSP ENDPOINT"}</span><input required value={form.source} onChange={(event) => update("source", event.target.value)} placeholder={form.source_type === "webcam" ? "0" : "rtsp://camera/stream"} type={form.source_type === "rtsp" ? "password" : "text"} autoComplete="off" /></label>}
-    {form.source_type === "rtsp" && <p className="form-hint">Credentials in the endpoint remain in memory and are stripped from saved camera registry records. For persistence across restarts, configure secrets through the local environment.</p>}
+    {form.source_type === "rtsp" && <><label className="field"><span>USERNAME · OPTIONAL</span><input autoComplete="off" value={form.username} onChange={(event) => update("username", event.target.value)} maxLength={256} /></label><label className="field"><span>PASSWORD · OPTIONAL</span><input type="password" autoComplete="new-password" value={form.password} onChange={(event) => update("password", event.target.value)} maxLength={256} /></label><p className="form-hint">The endpoint is tested for a readable frame before saving. The complete URL, credentials, and query parameters are protected with Windows DPAPI.</p></>}
     <button className="button primary full" disabled={!!busy || form.source_type === "video" && !videoFile}>{busy === "add-source" ? "Saving…" : "Add camera source"}</button>
   </form></section></div>;
 }

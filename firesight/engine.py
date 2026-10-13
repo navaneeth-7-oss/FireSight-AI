@@ -3,10 +3,12 @@ from __future__ import annotations
 import threading
 import time
 import logging
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -222,10 +224,30 @@ def test_video_connection(source: str | int) -> tuple[int, int]:
     """Probe a stream with one frame and always release it; does not run inference."""
     capture_source = _capture_source(source)
     is_rtsp = "rtsp://" in str(source).lower() or "rtsps://" in str(source).lower()
+    if is_rtsp:
+        parts = urlsplit(str(source))
+        host = parts.hostname
+        try:
+            port = parts.port or (322 if parts.scheme.lower() == "rtsps" else 554)
+        except ValueError as exc:
+            raise OSError("RTSP endpoint has an invalid port number.") from exc
+        if not host:
+            raise OSError("RTSP endpoint does not contain a valid camera host.")
+        try:
+            with socket.create_connection((host, port), timeout=3.0):
+                pass
+        except socket.gaierror as exc:
+            raise OSError("Camera host could not be resolved. Check the camera address and local network.") from exc
+        except (socket.timeout, TimeoutError) as exc:
+            raise TimeoutError("RTSP control connection timed out before the camera could be probed.") from exc
+        except ConnectionRefusedError as exc:
+            raise OSError("Camera host is reachable but refused the RTSP port. Check the RTSP service and port.") from exc
+        except OSError as exc:
+            raise OSError("Camera host or RTSP port is unreachable from this computer.") from exc
     capture = _open_capture(capture_source, is_rtsp)
     try:
         if not capture.isOpened():
-            raise OSError("Unable to connect to camera. Check the RTSP URL, network, and credentials.")
+            raise OSError("The RTSP service is reachable but did not open the stream. Check authentication and the stream path/channel; some cameras do not distinguish these failures.")
         ok, frame = capture.read()
         if not ok or frame is None or not frame.size:
             raise OSError("Camera connected but did not provide a readable video frame.")
@@ -240,10 +262,12 @@ def run_video_source(
     source: str | int,
     *,
     stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
     save_output: bool = False,
     on_frame: Callable[[FrameResult], None] | None = None,
     camera_name: str | None = None,
     on_status: Callable[[str, str | None], None] | None = None,
+    on_source_info: Callable[[float, int], None] | None = None,
     reconnect_attempts: int = 2,
 ) -> VideoSummary:
     """Process a file or RTSP source, optionally writing an annotated MP4."""
@@ -259,6 +283,7 @@ def run_video_source(
     attempts = 0
     final_status = "OFFLINE"
     connected_frame_received = False
+    is_paused = False
 
     def open_stream() -> cv2.VideoCapture:
         nonlocal attempts
@@ -289,7 +314,22 @@ def run_video_source(
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         if not np.isfinite(fps) or fps <= 0 or fps > 240:
             fps = 20.0
+        total_frames = int(max(0.0, capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        if on_source_info is not None:
+            on_source_info(fps, total_frames if not is_rtsp and not isinstance(capture_source, int) else 0)
         while not stop_event.is_set():
+            if pause_event is not None and pause_event.is_set():
+                if not is_paused:
+                    is_paused = True
+                    engine.reset_session()
+                    if on_status is not None:
+                        on_status("PAUSED", None)
+                stop_event.wait(0.05)
+                continue
+            if is_paused:
+                is_paused = False
+                if on_status is not None:
+                    on_status("CONNECTED", None)
             started = time.monotonic()
             ok, frame = capture.read()
             if not ok:

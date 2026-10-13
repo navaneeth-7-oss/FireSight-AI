@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -32,6 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 from .config import AppConfig, build_rtsp_url, load_config
 from .engine import FireSightEngine, FrameResult, run_video_source, test_video_connection
 from .events import sanitize_source
+from .secrets import CameraSecretStore, SecretStoreUnavailable
 
 LOG = logging.getLogger("firesight.api")
 CameraKind = Literal["webcam", "rtsp", "video"]
@@ -50,6 +52,8 @@ class CameraInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     source_type: CameraKind
     source: str = Field(min_length=1, max_length=2048)
+    username: str = Field(default="", max_length=256)
+    password: str = Field(default="", max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -71,6 +75,8 @@ class CameraInput(BaseModel):
 class CameraPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     source: str | None = Field(default=None, min_length=1, max_length=2048)
+    username: str | None = Field(default=None, max_length=256)
+    password: str | None = Field(default=None, max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -99,6 +105,12 @@ class SettingsPatch(BaseModel):
     reconnect_attempts: int | None = Field(default=None, ge=0, le=10)
 
 
+class CameraTestInput(BaseModel):
+    source: str | None = Field(default=None, min_length=1, max_length=2048)
+    username: str = Field(default="", max_length=256)
+    password: str = Field(default="", max_length=256)
+
+
 @dataclass
 class Camera:
     camera_id: str
@@ -115,7 +127,10 @@ class Camera:
     latest_jpeg: bytes | None = None
     worker: threading.Thread | None = None
     stop_event: threading.Event | None = None
+    pause_event: threading.Event | None = None
     last_frame_monotonic: float | None = None
+    video_fps: float | None = None
+    video_total_frames: int | None = None
 
 
 class FireSightService:
@@ -133,6 +148,8 @@ class FireSightService:
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.settings_path = config.project_root / "runs" / "firesight" / "api_settings.json"
         self.camera_path = config.project_root / "runs" / "firesight" / "api_cameras.json"
+        self.secret_store = CameraSecretStore(config.project_root / "runs" / "firesight" / "api_camera_secrets.json")
+        self.secret_store_error: str | None = None
         self.settings = self._load_settings()
         self.engine.config = replace(
             config,
@@ -176,12 +193,29 @@ class FireSightService:
         except (ValueError, json.JSONDecodeError):
             LOG.warning("Ignoring invalid camera registry file")
         cameras: dict[str, Camera] = {}
+        secrets: dict[str, str] = {}
+        try:
+            secrets = self.secret_store.load()
+        except SecretStoreUnavailable:
+            self.secret_store_error = "Protected camera secrets could not be recovered for this Windows user. Re-enter the RTSP endpoint and credentials."
         for row in rows:
             try:
                 source_type = row["source_type"]
                 if source_type not in {"webcam", "rtsp", "video"}:
                     continue
-                camera = Camera(str(row["id"]), str(row["name"]), source_type, str(row["source"]), row.get("file_label"))
+                camera_id = str(row["id"])
+                source = str(row["source"])
+                if source_type == "rtsp":
+                    if camera_id in secrets:
+                        source = secrets[camera_id]
+                    elif self.secret_store_error:
+                        source = sanitize_source(source)
+                    elif urlsplit(source).username or urlsplit(source).password or urlsplit(source).query:
+                        # Safely migrate legacy full URLs on the next registry write.
+                        pass
+                camera = Camera(camera_id, str(row["name"]), source_type, source, row.get("file_label"))
+                if source_type == "rtsp" and self.secret_store_error:
+                    camera.status, camera.last_error = "error", self.secret_store_error
                 cameras[camera.camera_id] = camera
             except (KeyError, TypeError):
                 continue
@@ -194,13 +228,34 @@ class FireSightService:
                 source, source_type, name = "0", "webcam", self.config.camera_name or "Laptop Webcam"
             camera = Camera("default", name, source_type, source)
             cameras[camera.camera_id] = camera
+        # Legacy raw URL records are migrated immediately into DPAPI storage.
+        if not self.secret_store_error and any(c.source_type == "rtsp" for c in cameras.values()):
+            try:
+                self._save_cameras(cameras=cameras)
+            except HTTPException as exc:
+                self.secret_store_error = str(exc.detail)
+                for camera in cameras.values():
+                    if camera.source_type == "rtsp":
+                        camera.source = sanitize_source(camera.source)
+                        camera.status, camera.last_error = "error", self.secret_store_error
+                self._write_camera_registry(cameras)
         return cameras
 
-    def _save_cameras(self) -> None:
+    def _save_cameras(self, *, cameras: dict[str, Camera] | None = None) -> None:
+        cameras = cameras if cameras is not None else self.cameras
+        if self.secret_store_error:
+            raise HTTPException(503, self.secret_store_error)
+        try:
+            self.secret_store.save({c.camera_id: c.source for c in cameras.values() if c.source_type == "rtsp"})
+        except SecretStoreUnavailable as exc:
+            raise HTTPException(503, "Windows DPAPI secret storage is unavailable; camera credentials were not saved.") from exc
+        self._write_camera_registry(cameras)
+
+    def _write_camera_registry(self, cameras: dict[str, Camera]) -> None:
         self.camera_path.parent.mkdir(parents=True, exist_ok=True)
         rows = [
             {"id": c.camera_id, "name": c.name, "source_type": c.source_type, "source": sanitize_source(c.source), "file_label": c.file_label}
-            for c in self.cameras.values()
+            for c in cameras.values()
         ]
         temp = self.camera_path.with_suffix(".tmp")
         temp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
@@ -231,6 +286,9 @@ class FireSightService:
             "inference_ms": camera.inference_ms,
             "fps": camera.fps,
             "frame_number": camera.frame_number,
+            "video_total_frames": camera.video_total_frames,
+            "video_progress": min(1.0, camera.frame_number / camera.video_total_frames) if camera.video_total_frames else None,
+            "video_duration_seconds": round(camera.video_total_frames / camera.video_fps, 2) if camera.video_total_frames and camera.video_fps else None,
             "source_label": "RTSP endpoint configured" if camera.source_type == "rtsp" else camera.file_label or Path(camera.source).name if camera.source_type == "video" else f"Device {camera.source}",
         }
 
@@ -244,7 +302,7 @@ class FireSightService:
         source = data.source
         if data.source_type == "rtsp":
             try:
-                build_rtsp_url(source)
+                source = build_rtsp_url(source, data.username, data.password)
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
         elif data.source_type == "webcam":
@@ -257,8 +315,9 @@ class FireSightService:
         elif data.source_type == "video" and not Path(source).expanduser().is_file():
             raise HTTPException(422, "Video source must be an existing local file")
         camera = Camera(uuid.uuid4().hex, data.name, data.source_type, source)
-        self.cameras[camera.camera_id] = camera
-        self._save_cameras()
+        updated_cameras = {**self.cameras, camera.camera_id: camera}
+        self._save_cameras(cameras=updated_cameras)
+        self.cameras = updated_cameras
         return camera
 
     def _frame(self, camera_id: str, result: FrameResult) -> None:
@@ -276,8 +335,15 @@ class FireSightService:
             camera.latest_jpeg = encoded.tobytes()
             camera.inference_ms = round(sum(result.speed_ms.values()), 2) if result.speed_ms else None
             camera.frame_number += 1
-            camera.status = "connected"
+            camera.status = "paused" if camera.pause_event is not None and camera.pause_event.is_set() else "connected"
             camera.last_error = None
+
+    def _source_info(self, camera_id: str, fps: float, total_frames: int) -> None:
+        with self.lock:
+            camera = self.cameras.get(camera_id)
+            if camera is not None and camera.source_type == "video":
+                camera.video_fps = fps
+                camera.video_total_frames = total_frames or None
 
     def _status(self, camera_id: str, status: str, error: str | None) -> None:
         state = status.strip().lower()
@@ -300,12 +366,17 @@ class FireSightService:
             if self.image_inference_active:
                 raise HTTPException(409, "Wait for standalone image inference to finish before connecting a source")
             if camera.worker and camera.worker.is_alive():
-                if camera.status in {"connecting", "connected", "reconnecting", "degraded"}:
+                if camera.status in {"connecting", "connected", "reconnecting", "degraded", "paused"}:
                     return camera
             active = [c for c in self.cameras.values() if c.worker and c.worker.is_alive()]
             if any(c.camera_id != camera_id for c in active):
                 raise HTTPException(409, "Only one active camera is supported by this inference service")
             camera.stop_event = threading.Event()
+            camera.pause_event = threading.Event()
+            if camera.source_type == "video":
+                camera.frame_number = 0
+                camera.video_fps = None
+                camera.video_total_frames = None
             camera.status, camera.last_error = "connecting", None
             camera.worker = threading.Thread(
                 target=self._run_camera,
@@ -326,9 +397,11 @@ class FireSightService:
                     self.engine,
                     source,
                     stop_event=stop_event,
+                    pause_event=camera.pause_event,
                     on_frame=lambda result: self._frame(camera_id, result),
                     camera_name=name,
                     on_status=lambda status, error: self._status(camera_id, status, error),
+                    on_source_info=lambda fps, frames: self._source_info(camera_id, fps, frames),
                     reconnect_attempts=self.settings["reconnect_attempts"],
                 )
         except Exception as exc:
@@ -359,6 +432,22 @@ class FireSightService:
                 camera.status = "disconnected"
                 camera.fps = None
         return camera
+
+    def pause(self, camera_id: str, paused: bool) -> Camera:
+        with self.lock:
+            camera = self.get_camera(camera_id)
+            if camera.source_type != "video":
+                raise HTTPException(409, "Pause and resume are supported for local video sources only")
+            if not camera.worker or not camera.worker.is_alive() or camera.pause_event is None:
+                raise HTTPException(409, "Start the video source before pausing or resuming it")
+            if paused:
+                camera.pause_event.set()
+                camera.status = "paused"
+                camera.fps = None
+            else:
+                camera.pause_event.clear()
+                camera.status = "connecting"
+            return camera
 
     def any_active(self) -> bool:
         with self.lock:
@@ -412,6 +501,22 @@ class FireSightService:
         elif not Path(source).expanduser().is_file():
             raise HTTPException(422, "Video source must be an existing local file")
         return source
+
+    @staticmethod
+    def connection_diagnostic(exc: Exception) -> str:
+        """Map noisy backend/FFmpeg failures to safe, actionable messages."""
+        detail = str(exc).lower()
+        if "did not open the stream" in detail or "some cameras do not distinguish" in detail:
+            return "The RTSP service is reachable, but the stream was rejected. Verify both the camera credentials and the RTSP path/channel; some camera firmware reports these failures identically."
+        if any(term in detail for term in ("401", "403", "unauthorized", "authentication", "auth failed", "forbidden")):
+            return "Camera rejected authentication. Verify the RTSP username and password, then test again."
+        if any(term in detail for term in ("timed out", "timeout", "deadline")):
+            return "Connection timed out. Check that the camera is online, the RTSP port is reachable on your local network, and the camera permits this client."
+        if any(term in detail for term in ("refused", "unreachable", "no route", "name or service", "getaddrinfo", "host not found", "could not be resolved")):
+            return "Camera host is unreachable. Check its address, power, Wi-Fi/Ethernet connection, and RTSP port."
+        if any(term in detail for term in ("404", "not found", "no video", "invalid data", "stream path", "readable video frame")):
+            return "The camera opened but no video frame was available. Check the RTSP stream path/channel and that the camera is streaming video."
+        return "Connection failed. Verify the RTSP URL, credentials, local network access, and stream path."
 
 
 def _safe_event(event: dict) -> dict:
@@ -533,6 +638,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 camera.name = payload.name.strip()
             if payload.source is not None:
                 camera.source = current.validate_source(camera.source_type, payload.source)
+            if camera.source_type == "rtsp" and (payload.username is not None or payload.password is not None):
+                camera.source = build_rtsp_url(camera.source, payload.username or "", payload.password or "")
+            if payload.source is not None or payload.username is not None or payload.password is not None:
                 if camera.source_type == "video":
                     camera.file_label = Path(camera.source).name
             current._save_cameras()
@@ -559,8 +667,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         camera = current.disconnect(camera_id)
         return current.camera_view(camera)
 
+    @application.post("/api/cameras/{camera_id}/pause")
+    def pause_camera(camera_id: str, request: Request):
+        return service(request).camera_view(service(request).pause(camera_id, True))
+
+    @application.post("/api/cameras/{camera_id}/resume")
+    def resume_camera(camera_id: str, request: Request):
+        return service(request).camera_view(service(request).pause(camera_id, False))
+
     @application.post("/api/cameras/{camera_id}/test")
-    async def test_camera(camera_id: str, request: Request):
+    async def test_camera(camera_id: str, request: Request, payload: CameraTestInput | None = None):
         current = service(request)
         camera = current.get_camera(camera_id)
         if (camera.worker and camera.worker.is_alive()) or current.any_active():
@@ -568,9 +684,36 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if not await asyncio.to_thread(current.probe_lock.acquire, True, 0.1):
             raise HTTPException(409, "A connection test is already in progress")
         try:
-            width, height = await asyncio.to_thread(test_video_connection, camera.source)
+            source = camera.source
+            if payload is not None:
+                try:
+                    source = build_rtsp_url(payload.source or camera.source, payload.username, payload.password)
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+            width, height = await asyncio.to_thread(test_video_connection, source)
         except Exception as exc:
-            return {"ok": False, "status": "error", "diagnostic": f"Connection failed ({type(exc).__name__}). Check the endpoint, credentials, network, and codec."}
+            return {"ok": False, "status": "error", "diagnostic": current.connection_diagnostic(exc)}
+        finally:
+            current.probe_lock.release()
+        return {"ok": True, "status": "valid_frame_received", "width": width, "height": height}
+
+    @application.post("/api/cameras/test")
+    async def test_camera_before_save(payload: CameraTestInput, request: Request):
+        current = service(request)
+        if not payload.source:
+            raise HTTPException(422, "Enter a complete RTSP endpoint before testing.")
+        try:
+            source = build_rtsp_url(payload.source, payload.username, payload.password)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if current.any_active():
+            raise HTTPException(409, "Stop active monitoring before probing another capture connection")
+        if not await asyncio.to_thread(current.probe_lock.acquire, True, 0.1):
+            raise HTTPException(409, "A connection test is already in progress")
+        try:
+            width, height = await asyncio.to_thread(test_video_connection, source)
+        except Exception as exc:
+            return {"ok": False, "status": "error", "diagnostic": current.connection_diagnostic(exc)}
         finally:
             current.probe_lock.release()
         return {"ok": True, "status": "valid_frame_received", "width": width, "height": height}

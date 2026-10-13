@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -49,15 +49,19 @@ class AppConfig:
 
 
 def build_rtsp_url(url: str, username: str = "", password: str = "") -> str:
-    """Apply separately entered credentials to an RTSP URL without persisting them."""
+    """Build an RTSP URL while preserving existing auth, IPv6 hosts and query parameters."""
     parts = urlsplit(url.strip())
     if parts.scheme.lower() not in {"rtsp", "rtsps"} or not parts.netloc:
         raise ValueError("Enter a complete rtsp:// or rtsps:// camera URL.")
     host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     if parts.port:
         host += f":{parts.port}"
-    if username or password:
-        credentials = quote(username, safe="") + (":" + quote(password, safe="") if password else "") + "@"
+    selected_username = username if username else unquote(parts.username or "")
+    selected_password = password if password else unquote(parts.password or "")
+    if selected_username or selected_password:
+        credentials = quote(selected_username, safe="") + (":" + quote(selected_password, safe="") if selected_password else "") + "@"
     else:
         credentials = ""
     return urlunsplit((parts.scheme, credentials + host, parts.path, parts.query, ""))
