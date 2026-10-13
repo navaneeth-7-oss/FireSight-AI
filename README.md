@@ -17,6 +17,7 @@ The repository includes a React dashboard, a FastAPI service, a desktop Tkinter 
 - [CCTV and RTSP setup](#cctv-and-rtsp-setup)
 - [Configuration reference](#configuration-reference)
 - [API overview](#api-overview)
+- [CI and deployment preparation](#ci-and-deployment-preparation)
 - [Tests and evaluation](#tests-and-evaluation)
 - [Troubleshooting](#troubleshooting)
 - [Repository map](#repository-map)
@@ -182,6 +183,7 @@ For local integration testing, a developer may run MediaMTX with a test publishe
 | `FIRESIGHT_OUTPUT_VIDEO_DIR` | Processed video output directory | `runs/firesight/processed_video` | Optional |
 | `FIRESIGHT_INTERNAL_ALERTS` | Enables internal event handling setting | `true` | Optional |
 | `FIRESIGHT_EXTERNAL_ALERTS` | Requests external-alert mode | `false` | Optional; no provider is implemented |
+| `FIRESIGHT_CORS_ORIGINS` | Comma-separated exact browser origins allowed by the API | `http://127.0.0.1:5173,http://localhost:5173` | Optional; do not use `*` |
 
 The dashboard also persists `confidence_threshold`, `confirmation_frames`, and `reconnect_attempts` in ignored `runs/firesight/api_settings.json`. `reconnect_attempts` defaults to `2` and is constrained to 0–10. `max_active_sources` is currently fixed at one. These are API settings, not `FIRESIGHT_*` environment variables.
 
@@ -202,6 +204,30 @@ The development API is local and unauthenticated. Keep it on loopback and do not
 | `GET /api/evidence/{id}` | Preview or download evidence for a persisted event. |
 | `GET /api/analytics/summary`, `/api/analytics/export.csv` | Event summary and CSV export. |
 | `GET/PATCH /api/settings` | Read/update validated inference and reconnect settings. |
+
+## CI and deployment preparation
+
+[`CI workflow`](.github/workflows/ci.yml) runs on pushes, pull requests, and manual dispatch. [`Repository safety scanner`](scripts/check_repo_safety.py) checks changed-file whitespace/secrets/artifacts; CI imports the FastAPI app and health route, runs the Python suite, and installs the frozen pnpm dependencies before a production build. It does not deploy. Protect `main` in GitHub Settings → Branches: require pull requests, require all three checks (`CI / Repository and secret safety`, `CI / Backend tests and import validation`, `CI / Frontend production build`), and disallow direct pushes or check bypass. The production branch remains `main`; this repository's dashboard work is still on `feature/production-dashboard` until maintainers merge it.
+
+### Vercel frontend
+
+After the dashboard changes are merged into `main`, create a Vercel project using the GitHub repository with **Root Directory** `frontend`, **Production Branch** `main`, build command `pnpm build`, and output directory `dist`. Use Vercel's native Git integration for preview and production builds; no Vercel token or deployment secret is needed in GitHub Actions. Set the frontend project environment variable `VITE_API_BASE_URL` to the HTTPS base URL of the separately hosted API. The blank value in [`frontend/.env.example`](frontend/.env.example) is for local Vite proxy use. A preview frontend requires its own allowed API origin if it needs to call the backend; the backend CORS setting is deliberately an exact allowlist.
+
+Production deployment gating depends on the GitHub branch rule: only merge a PR to `main` after all required checks pass, and prevent bypass/direct pushes. Vercel's production branch must also remain `main`. Preview deployments may be generated for PRs; they are not proof that the backend or CCTV integration works.
+
+### FastAPI backend: current deployment blockers
+
+No backend hosting provider, deployment workflow, or production deployment is configured. The API is unauthenticated, has no built-in TLS, and camera secrets use Windows per-user DPAPI. A public cloud host—especially a Linux host—cannot safely provide the current authenticated-camera behavior: DPAPI is unavailable there, and the API intentionally refuses a plaintext fallback. Do not expose this API to the public internet. Before hosting it, add and review authentication/access control, TLS at a trusted edge, and a secret-store design supported by the selected host. CORS only controls which browsers may read cross-origin responses; it is not authentication or a firewall.
+
+For a private deployment evaluation only, a compatible host can install `requirements.txt` and `requirements-api.txt` and start the ASGI app with a provider-specific command equivalent to `uvicorn firesight.api:app --host 0.0.0.0 --port $PORT`. Set backend environment variables in the host console, including `FIRESIGHT_CORS_ORIGINS` to the exact HTTPS frontend origin. Set frontend `VITE_API_BASE_URL` to the HTTPS API base URL at build time; HTTPS pages cannot use an HTTP API. Keep default loopback CORS origins for local development.
+
+The API writes its camera registry, protected camera-secret file, settings, uploaded videos, SQLite event database, logs, and evidence beneath `runs/firesight/` by default (the evidence, database, detection log, and output-video paths can be configured separately). A host with ephemeral storage loses this state on restart/redeploy. Configure and test a persistent volume before using such a host, back it up, and do not allow deployment scripts to clear it. `models/best.pt` is tracked, but its small file size does not indicate the RAM needed for PyTorch/YOLO. CPU/GPU memory and latency requirements have not been measured; benchmark the exact model on the exact target instance before selecting a host. No free-tier capacity or persistent-storage guarantee is assumed.
+
+The smoke endpoint for a deployed service is `GET /api/health`; it checks process liveness only, not model readiness, storage persistence, authentication, or camera connectivity. Check `/api/system/status` separately after adding deployment security. Never add real provider credentials to the repository; use provider environment settings or narrowly scoped GitHub Actions secrets only if a later reviewed deployment workflow needs them.
+
+### Rollback
+
+For a bad application change merged to `main`, revert it with a new commit (`git revert <commit-sha>`) and let required checks pass before Vercel builds the production branch. Vercel also provides deployment history for selecting a prior successful frontend deployment. Use the selected backend host's deployment history for API rollback. Back up the persistent volume before rollback and verify code/database compatibility; a code rollback must not delete or replace evidence, camera configuration, or the event database.
 
 ## Tests and evaluation
 

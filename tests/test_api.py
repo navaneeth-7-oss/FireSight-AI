@@ -274,5 +274,19 @@ class DiagnosticRedactionTests(unittest.TestCase):
                 self.assertIn(expected, FireSightService.connection_diagnostic(error).lower())
 
 
+class CorsConfigurationTests(unittest.TestCase):
+    def test_configured_origins_are_exact_and_https_origins_are_supported(self):
+        with patch.dict("os.environ", {"FIRESIGHT_CORS_ORIGINS": "https://dashboard.example/, https://admin.example:443"}):
+            application = create_app(load_config())
+        cors = next(middleware for middleware in application.user_middleware if middleware.cls.__name__ == "CORSMiddleware")
+        self.assertEqual(cors.kwargs["allow_origins"], ["https://dashboard.example", "https://admin.example"])
+
+    def test_cors_configuration_rejects_wildcards_and_paths(self):
+        for value in ("*", "https://dashboard.example/app", "https://dashboard.example:", "file:///tmp"):
+            with self.subTest(value=value), patch.dict("os.environ", {"FIRESIGHT_CORS_ORIGINS": value}):
+                with self.assertRaisesRegex(ValueError, "FIRESIGHT_CORS_ORIGINS"):
+                    create_app(load_config())
+
+
 if __name__ == "__main__":
     unittest.main()

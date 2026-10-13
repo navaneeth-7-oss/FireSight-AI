@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -562,6 +563,45 @@ def _canonical_date(value: str, *, end: bool) -> str:
     return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _cors_origins() -> list[str]:
+    configured = os.environ.get("FIRESIGHT_CORS_ORIGINS")
+    if configured is None:
+        return ["http://127.0.0.1:5173", "http://localhost:5173"]
+
+    origins: list[str] = []
+    for raw_origin in configured.split(","):
+        origin = raw_origin.strip().rstrip("/")
+        try:
+            parts = urlsplit(origin)
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("FIRESIGHT_CORS_ORIGINS must contain valid exact HTTP(S) origins.") from exc
+        if (
+            parts.scheme.lower() not in {"http", "https"}
+            or not parts.hostname
+            or parts.netloc.endswith(":")
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path
+            or "?" in origin
+            or "#" in origin
+            or origin == "*"
+        ):
+            raise ValueError("FIRESIGHT_CORS_ORIGINS must contain valid exact HTTP(S) origins, not paths or wildcards.")
+        scheme = parts.scheme.lower()
+        host = parts.hostname.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+            host += f":{port}"
+        normalized = f"{scheme}://{host}"
+        if normalized not in origins:
+            origins.append(normalized)
+    if not origins:
+        raise ValueError("FIRESIGHT_CORS_ORIGINS must contain at least one exact HTTP(S) origin.")
+    return origins
+
+
 def create_app(config: AppConfig | None = None) -> FastAPI:
     app_config = config or load_config()
 
@@ -580,7 +620,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     )
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=_cors_origins(),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Content-Type", "X-File-Name"],

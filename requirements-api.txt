@@ -1,5 +1,6 @@
 # Install after requirements.txt, in the same Python 3.12 environment.
-fastapi>=0.115,<1.0
-pydantic>=2.7,<3.0
-uvicorn>=0.30,<1.0
-httpx>=0.27,<1.0
+# Direct API/test dependencies are pinned to the versions validated for this branch.
+fastapi==0.143.0
+pydantic==2.14.1
+uvicorn==0.54.0
+httpx==0.28.1
