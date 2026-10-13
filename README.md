@@ -1,6 +1,6 @@
 # FireSight AI
 
-**See fire and smoke sooner.** FireSight AI is a local-first computer-vision application that analyzes webcam, video-file, and RTSP/RTSPS camera streams, displays annotated frames, and records confirmed fire and smoke events with evidence images.
+ FireSight AI is a local-first computer-vision application that analyzes webcam, video-file, and RTSP/RTSPS camera streams, displays annotated frames, and records confirmed fire and smoke events with evidence images.
 
 The repository includes a React dashboard, a FastAPI service, a desktop Tkinter interface, a YOLO inference engine, and offline evaluation and runtime-benchmark tools. It is intended as an inspectable development and demonstration project; it is not a certified fire-alarm system or a substitute for code-compliant life-safety equipment.
 
